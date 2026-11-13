@@ -1,0 +1,553 @@
+@page "/topology"
+@using SmartX.Shared.Mesh
+@inject MeshClient Api
+
+<PageTitle>Network topology</PageTitle>
+
+<h1>Network topology and mesh routing</h1>
+<p class="lede">
+    Weighted radio mesh for the seeded devices. Link numbers are demonstration costs, not measured signal strength.
+    Facility, zone, and sub-zone placement stays on the registration check. It is not this graph.
+</p>
+<p class="section-links">
+    <a href="topology">Topology</a>
+    <span>·</span>
+    <a href="ingestion">Ingest</a>
+    <span>·</span>
+    <a href="command-stream">Stream</a>
+</p>
+
+@if (mesh is null && string.IsNullOrEmpty(error))
+{
+    <p>Loading the mesh…</p>
+}
+else if (mesh is null)
+{
+    <div class="alert alert-danger">@error</div>
+}
+else if (sensors.Count == 0)
+{
+    <p class="tiny">No registered sensors are in the mesh yet.</p>
+}
+else
+{
+    @if (!string.IsNullOrEmpty(error))
+    {
+        <div class="alert alert-danger">@error</div>
+    }
+
+    <div class="card mesh-card mb-3">
+        <div class="card-header">Active mesh</div>
+        <div class="card-body">
+            <p class="tiny">@mesh.CostSemantics Gateway, connected sensors, and offline sensors use different marks. A purple link is in the minimum spanning tree. A blue link is the selected least-cost route. A sensor with no active link stays on the map and is marked unreachable.</p>
+            @if (mesh.UnreachableIds.Count > 0)
+            {
+                <p class="tiny">@mesh.UnreachableIds.Count @(mesh.UnreachableIds.Count == 1 ? "sensor is" : "sensors are") registered with no active path to the gateway.</p>
+            }
+            <div class="topo-scroll">
+                <svg viewBox="0 0 800 500" class="topo-map" role="img" aria-label="Weighted mesh topology">
+                    @foreach (var edge in mesh.Edges)
+                    {
+                        var from = Point(edge.From);
+                        var to = Point(edge.To);
+                        <line x1="@from.X" y1="@from.Y" x2="@to.X" y2="@to.Y" class="@EdgeClass(edge)" />
+                        @SvgText((from.X + to.X) / 2, (from.Y + to.Y) / 2 - 4, "topo-cost", edge.Cost.ToString())
+                    }
+                    @foreach (var vertex in mesh.Vertices)
+                    {
+                        var point = Point(vertex.Id);
+                        <circle cx="@point.X" cy="@point.Y" r="15" class="@NodeClass(vertex)"
+                                @onclick="() => Choose(vertex.Id)" />
+                        @SvgText(point.X, point.Y + 28, "topo-label", ShortName(vertex))
+                    }
+                </svg>
+            </div>
+        </div>
+    </div>
+
+    <div class="row g-3">
+        <div class="col-lg-6">
+            <div class="card mesh-card h-100">
+                <div class="card-header">Sensor to gateway</div>
+                <div class="card-body">
+                    <label class="form-label">Sensor</label>
+                    <select class="form-select mb-2" @bind="selectedMac" @bind:after="LoadRoute">
+                        @foreach (var sensor in sensors)
+                        {
+                            <option value="@sensor.Id">@sensor.DisplayName (@sensor.Id)</option>
+                        }
+                    </select>
+                    @if (routeBusy)
+                    {
+                        <p class="tiny">Loading route…</p>
+                    }
+                    else if (route is null)
+                    {
+                        <p class="tiny">Choose a sensor to see its route.</p>
+                    }
+                    else if (!route.Reachable)
+                    {
+                        <div class="alert alert-warning">@route.Explanation</div>
+                        <button class="btn btn-outline-secondary btn-sm" @onclick="() => SetOnline(route.MacAddress, true)" disabled="@busy">Restore</button>
+                    }
+                    else
+                    {
+                        <p class="tiny">@route.Explanation</p>
+                        <h2 class="h6">Least-cost path (Dijkstra)</h2>
+                        <p>@PathText(route.LeastCostPath) · cost @route.LeastCost</p>
+                        <h2 class="h6">Fewest hops (breadth-first search)</h2>
+                        <p>@PathText(route.FewestHopPath) · cost @route.FewestHopCost · @HopCount(route.FewestHopPath)</p>
+                        <h2 class="h6">Path along the spanning tree</h2>
+                        <p>@PathText(route.SpanningTreePath) · cost @route.SpanningTreeCost</p>
+                        @if (relays.Count > 0)
+                        {
+                            <p class="tiny mb-1">Take an intermediate hop offline to see whether another route remains.</p>
+                            @foreach (var relay in relays)
+                            {
+                                <button class="btn btn-sm btn-outline-danger me-2 mb-2" disabled="@busy"
+                                        @onclick="() => SetOnline(relay, false)">
+                                    Offline @Name(relay)
+                                </button>
+                            }
+                        }
+                    }
+                </div>
+            </div>
+        </div>
+        <div class="col-lg-6">
+            <div class="card mesh-card mb-3">
+                <div class="card-header">Traversal</div>
+                <div class="card-body">
+                    <div class="row g-2 align-items-end">
+                        <div class="col-md-6">
+                            <label class="form-label">Start</label>
+                            <select class="form-select" @bind="traverseStart">
+                                <option value="GATEWAY">Central gateway</option>
+                                @foreach (var sensor in sensors.Where(sensor => !sensor.Offline))
+                                {
+                                    <option value="@sensor.Id">@sensor.DisplayName</option>
+                                }
+                            </select>
+                        </div>
+                        <div class="col-md-6">
+                            <button class="btn btn-primary btn-sm me-2" @onclick='() => Traverse("bfs")' disabled="@busy">BFS</button>
+                            <button class="btn btn-outline-primary btn-sm" @onclick='() => Traverse("dfs")' disabled="@busy">DFS</button>
+                        </div>
+                    </div>
+                    @if (traversalBusy)
+                    {
+                        <p class="tiny mt-2">Walking the mesh…</p>
+                    }
+                    else if (traversal is not null)
+                    {
+                        <p class="tiny mt-2">@traversal.Algorithm.ToUpperInvariant() from @Name(traversal.Start). Unreachable: @traversal.Unreachable.Count.</p>
+                        <ol class="tiny mb-0">
+                            @foreach (var id in traversal.Order)
+                            {
+                                <li>@Name(id)</li>
+                            }
+                        </ol>
+                    }
+                </div>
+            </div>
+            <div class="card mesh-card">
+                <div class="card-header">Minimum spanning tree</div>
+                <div class="card-body">
+                    @if (tree is null)
+                    {
+                        <p class="tiny">Spanning tree is not loaded.</p>
+                    }
+                    else
+                    {
+                        <p>Total link cost <strong>@tree.TotalCost</strong> · @(tree.Connected ? "one connected tree" : $"{tree.ComponentCount} components")</p>
+                        <p class="tiny">@tree.Explanation</p>
+                    }
+                    @if (mesh.OfflineIds.Count == 0)
+                    {
+                        <p class="tiny mb-0">No simulated failures.</p>
+                    }
+                    else
+                    {
+                        @foreach (var id in mesh.OfflineIds)
+                        {
+                            <button class="btn btn-sm btn-outline-secondary me-2 mb-2" disabled="@busy"
+                                    @onclick="() => SetOnline(id, true)">
+                                Restore @Name(id)
+                            </button>
+                        }
+                    }
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="card mesh-card mt-3">
+        <div class="card-header">Links</div>
+        <div class="card-body p-0">
+            <div class="table-responsive">
+                <table class="table table-sm mb-0">
+                    <thead>
+                        <tr>
+                            <th>From</th>
+                            <th>To</th>
+                            <th>Cost</th>
+                            <th>State</th>
+                            <th>Note</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var edge in mesh.Edges)
+                        {
+                            <tr>
+                                <td>@Name(edge.From)</td>
+                                <td>@Name(edge.To)</td>
+                                <td>@edge.Cost</td>
+                                <td>@(edge.Active ? "Active" : "Inactive")@(IsTreeEdge(edge) ? " · spanning tree" : "")</td>
+                                <td class="tiny">
+                                    @edge.Note
+                                    @if (edge.OperatorDefined)
+                                    {
+                                        <button class="btn btn-sm btn-outline-secondary ms-2" disabled="@busy"
+                                                @onclick="() => RemoveLink(edge)">Remove</button>
+                                    }
+                                </td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <div class="card mesh-card mt-3">
+        <div class="card-header">Add a demonstration link</div>
+        <div class="card-body">
+            <p class="tiny">Choose both ends and a non-negative cost. The number is a demonstration hop cost, not measured RSSI. Seeded catalogue links stay fixed.</p>
+            <div class="row g-2">
+                <div class="col-md-3">
+                    <label class="form-label">From</label>
+                    <select class="form-select" @bind="linkFrom">
+                        <option value="GATEWAY">Central gateway</option>
+                        @foreach (var sensor in sensors)
+                        {
+                            <option value="@sensor.Id">@sensor.DisplayName</option>
+                        }
+                    </select>
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label">To</label>
+                    <select class="form-select" @bind="linkTo">
+                        <option value="GATEWAY">Central gateway</option>
+                        @foreach (var sensor in sensors)
+                        {
+                            <option value="@sensor.Id">@sensor.DisplayName</option>
+                        }
+                    </select>
+                </div>
+                <div class="col-md-2">
+                    <label class="form-label">Cost</label>
+                    <input class="form-control" type="number" min="0" @bind="linkCost" />
+                </div>
+                <div class="col-md-4 d-flex align-items-end">
+                    <button class="btn btn-primary" disabled="@busy" @onclick="AddLink">Add link</button>
+                </div>
+            </div>
+        </div>
+    </div>
+}
+
+@code {
+    private const string WaterPulse = "3C:71:BF:22:10:AA";
+
+    private static readonly Dictionary<string, (double X, double Y)> Layout = new(StringComparer.Ordinal)
+    {
+        ["GATEWAY"] = (400, 54),
+        ["24:6F:28:A1:B2:C3"] = (90, 160),
+        ["24:6F:28:A1:B2:C4"] = (220, 160),
+        ["24:6F:28:A1:B2:D1"] = (90, 300),
+        ["24:6F:28:A1:B2:E1"] = (220, 300),
+        ["24:6F:28:A1:B2:F1"] = (155, 430),
+        ["30:AE:A4:10:01:01"] = (500, 160),
+        ["30:AE:A4:10:01:02"] = (640, 160),
+        ["30:AE:A4:10:01:03"] = (570, 300),
+        ["3C:71:BF:22:10:AA"] = (720, 300),
+        ["3C:71:BF:22:10:AB"] = (720, 430)
+    };
+
+    private MeshSnapshot? mesh;
+    private MeshSpanningTree? tree;
+    private MeshRoute? route;
+    private MeshTraversal? traversal;
+    private string selectedMac = "";
+    private string traverseStart = "GATEWAY";
+    private string linkFrom = "GATEWAY";
+    private string linkTo = "";
+    private int linkCost = 4;
+    private string error = "";
+    private bool busy;
+    private bool routeBusy;
+    private bool traversalBusy;
+
+    private IReadOnlyList<MeshVertex> sensors =>
+        mesh?.Vertices.Where(vertex => vertex.Kind == "Sensor").ToList() ?? [];
+
+    private IReadOnlyList<string> relays =>
+        route is null || route.LeastCostPath.Count < 3
+            ? []
+            : route.LeastCostPath.Skip(1).Take(route.LeastCostPath.Count - 2).ToList();
+
+    protected override async Task OnInitializedAsync() => await LoadMesh(selectDefault: true);
+
+    private async Task LoadMesh(bool selectDefault)
+    {
+        busy = true;
+        error = "";
+        try
+        {
+            mesh = await Api.GetMeshAsync(CancellationToken.None);
+            tree = await Api.GetSpanningTreeAsync(CancellationToken.None);
+            if (selectDefault && sensors.Count > 0 && string.IsNullOrEmpty(selectedMac))
+            {
+                selectedMac = sensors.Any(sensor => sensor.Id == WaterPulse) ? WaterPulse : sensors[0].Id;
+            }
+
+            if (string.IsNullOrEmpty(linkTo) && sensors.Count > 0)
+            {
+                linkTo = sensors[0].Id;
+            }
+
+            if (!string.IsNullOrEmpty(selectedMac))
+            {
+                await LoadRoute();
+            }
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException)
+        {
+            error = ex.Message;
+        }
+        finally
+        {
+            busy = false;
+        }
+    }
+
+    private async Task Choose(string id)
+    {
+        if (id == "GATEWAY")
+        {
+            traverseStart = "GATEWAY";
+            return;
+        }
+
+        selectedMac = id;
+        await LoadRoute();
+    }
+
+    private async Task LoadRoute()
+    {
+        if (string.IsNullOrWhiteSpace(selectedMac))
+        {
+            return;
+        }
+
+        routeBusy = true;
+        error = "";
+        try
+        {
+            route = await Api.GetRouteAsync(selectedMac, CancellationToken.None);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException)
+        {
+            route = null;
+            error = ex.Message;
+        }
+        finally
+        {
+            routeBusy = false;
+        }
+    }
+
+    private async Task Traverse(string algorithm)
+    {
+        traversalBusy = true;
+        error = "";
+        try
+        {
+            traversal = await Api.TraverseAsync(algorithm, traverseStart, CancellationToken.None);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException)
+        {
+            traversal = null;
+            error = ex.Message;
+        }
+        finally
+        {
+            traversalBusy = false;
+        }
+    }
+
+    private async Task AddLink()
+    {
+        busy = true;
+        error = "";
+        try
+        {
+            await Api.AddLinkAsync(linkFrom, linkTo, linkCost, null, CancellationToken.None);
+            await LoadMesh(selectDefault: false);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException)
+        {
+            error = ex.Message;
+        }
+        finally
+        {
+            busy = false;
+        }
+    }
+
+    private async Task RemoveLink(MeshLink edge)
+    {
+        busy = true;
+        error = "";
+        try
+        {
+            await Api.RemoveLinkAsync(edge.From, edge.To, CancellationToken.None);
+            await LoadMesh(selectDefault: false);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException)
+        {
+            error = ex.Message;
+        }
+        finally
+        {
+            busy = false;
+        }
+    }
+
+    private async Task SetOnline(string mac, bool online)
+    {
+        busy = true;
+        error = "";
+        try
+        {
+            await Api.SetAvailabilityAsync(mac, online, CancellationToken.None);
+            mesh = await Api.GetMeshAsync(CancellationToken.None);
+            tree = await Api.GetSpanningTreeAsync(CancellationToken.None);
+            traversal = null;
+            if (!string.IsNullOrEmpty(selectedMac))
+            {
+                await LoadRoute();
+            }
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException)
+        {
+            error = ex.Message;
+        }
+        finally
+        {
+            busy = false;
+        }
+    }
+
+    private (double X, double Y) Point(string id)
+    {
+        if (Layout.TryGetValue(id, out var point))
+        {
+            return point;
+        }
+
+        var index = Math.Max(0, sensors.ToList().FindIndex(sensor => sensor.Id == id));
+        return (80 + (index * 90), 470);
+    }
+
+    private string NodeClass(MeshVertex vertex)
+    {
+        var classes = "topo-node";
+        classes += vertex.Kind == "Gateway" ? " gateway" : " sensor";
+        if (vertex.Offline)
+        {
+            classes += " offline";
+        }
+        else if (vertex.Kind == "Sensor" && !vertex.Reachable)
+        {
+            classes += " unreachable";
+        }
+
+        if (vertex.Id == selectedMac)
+        {
+            classes += " selected";
+        }
+
+        return classes;
+    }
+
+    private string EdgeClass(MeshLink edge)
+    {
+        var classes = "topo-link";
+        if (!edge.Active)
+        {
+            classes += " inactive";
+        }
+        else if (IsRouteEdge(edge))
+        {
+            classes += " route";
+        }
+        else if (IsTreeEdge(edge))
+        {
+            classes += " mst";
+        }
+
+        return classes;
+    }
+
+    private bool IsTreeEdge(MeshLink edge) =>
+        tree?.Edges.Any(candidate => SameEnds(candidate.From, candidate.To, edge.From, edge.To)) == true;
+
+    private bool IsRouteEdge(MeshLink edge)
+    {
+        var path = route?.LeastCostPath;
+        if (path is null)
+        {
+            return false;
+        }
+
+        for (var i = 1; i < path.Count; i++)
+        {
+            if (SameEnds(path[i - 1], path[i], edge.From, edge.To))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool SameEnds(string leftFrom, string leftTo, string rightFrom, string rightTo) =>
+        (leftFrom == rightFrom && leftTo == rightTo) || (leftFrom == rightTo && leftTo == rightFrom);
+
+    private string Name(string id) =>
+        mesh?.Vertices.FirstOrDefault(vertex => vertex.Id == id)?.DisplayName ?? id;
+
+    private static string ShortName(MeshVertex vertex) =>
+        vertex.Kind == "Gateway" ? "Gateway" : vertex.DisplayName;
+
+    private string PathText(IReadOnlyList<string> ids) =>
+        ids.Count == 0 ? "None" : string.Join(" → ", ids.Select(Name));
+
+    private static string HopCount(IReadOnlyList<string> path)
+    {
+        var hops = Math.Max(0, path.Count - 1);
+        return hops == 1 ? "1 hop" : $"{hops} hops";
+    }
+
+    private static RenderFragment SvgText(double x, double y, string css, string content) => builder =>
+    {
+        builder.OpenElement(0, "text");
+        builder.AddAttribute(1, "x", x);
+        builder.AddAttribute(2, "y", y);
+        builder.AddAttribute(3, "text-anchor", "middle");
+        builder.AddAttribute(4, "class", css);
+        builder.AddContent(5, content);
+        builder.CloseElement();
+    };
+}
