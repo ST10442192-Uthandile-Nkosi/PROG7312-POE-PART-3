@@ -59,8 +59,7 @@ Client routes:
 ## Prerequisites
 
 - [.NET 10 SDK](https://dotnet.microsoft.com/download). Projects target `net10.0`.
-- The verification run used runtime **10.0.5**.
-- Optional: Docker Desktop. Compose files are present. This documentation pass did not run `docker compose up`.
+- Optional: Docker Desktop with Docker Compose, for the container setup below.
 
 Package versions from the project files:
 
@@ -82,7 +81,7 @@ dotnet build SmartX.slnx
 dotnet test SmartX.Tests/SmartX.Tests.csproj
 ```
 
-The documentation session built with **0 warnings and 0 errors** and the test run passed **106**, failed **0**, skipped **0**. Re-run the commands during assessment. Do not treat a previous count as a substitute for a fresh run.
+`SmartX.Tests` defines 106 `[Fact]` methods and no `[Theory]` methods. Run the commands above on the machine used for assessment. A count from another machine is not a substitute for that run.
 
 **Terminal 1 — API** (`SmartX.Api/Properties/launchSettings.json`, profile `http`):
 
@@ -121,13 +120,24 @@ OpenAPI: [http://localhost:5057/openapi/v1.json](http://localhost:5057/openapi/v
 
 `SmartX.Client/wwwroot/appsettings.json` sets `ApiBaseUrl` to `http://localhost:5057`. If the API port changes, edit that file and restart the client.
 
-CORS in `SmartX.Api/Program.cs` allows `http://localhost:5197`, `https://localhost:7091`, and `http://localhost:8088`.
+CORS in `SmartX.Api/Program.cs` allows `https://localhost:7091`, `http://localhost:5197`, and `http://localhost:8088`.
 
-Docker, when used, maps API **5057→8080** and client **5197→80** (`docker-compose.yml`). The browser still calls `http://localhost:5057`.
+### Docker Compose
+
+`docker-compose.yml` builds the two Dockerfiles already in the tree.
+
+| Service | Build | Container listen | Published host port |
+| --- | --- | --- | --- |
+| `smartx-api` | `SmartX.Api/Dockerfile`, runtime image `mcr.microsoft.com/dotnet/aspnet:10.0` | 8080, set by `ASPNETCORE_URLS=http://+:8080` | **5057** |
+| `smartx-client` | `SmartX.Client/Dockerfile`, runtime image `nginx:1.27-alpine` | 80, from `SmartX.Client/nginx.conf` | **5197** |
+
+The client service depends on the API. The image still contains `ApiBaseUrl` of `http://localhost:5057`, so the browser calls the published API port on the host.
 
 ```bash
 docker compose up --build
 ```
+
+Open [http://localhost:5197](http://localhost:5197). The readiness check remains `curl -sS http://localhost:5057/`.
 
 | Symptom | What to check |
 | --- | --- |
@@ -397,20 +407,21 @@ A device can be in Facility C and still reach the gateway through Facility B. Re
 | Kruskal | Sort `Edges`, then union-find | O(E log E) for the sort, with near-constant union-find operations |
 | Dijkstra | Binary heap decrease by enqueueing a new entry | O((V + E) log V) for non-negative weights |
 
-Those bounds describe the algorithms as written. The millisecond figures in `PART3_FINAL_REPORT.md` are one measured run. They are not a statistical benchmark, and a slow machine does not fail the tests. The tests assert height, visit counts, edge sets, and path costs.
+Those bounds describe the algorithms as written. `AlgorithmPerformanceTests` asserts height, visit counts, edge sets, and path costs on fixed sizes. It prints elapsed milliseconds with `Stopwatch` and does not fail when that reading is slower. The printed time is one Debug process, with no warmup and no repeated samples. The AVL insert loop also calls `CheckInvariants` on every 1024th key. The campus timing wraps `MeshTopologyService.Route`, which rebuilds both graphs, and the failure timing includes `TrySetOnline` as well as the next route.
 
-One recorded run (runtime 10.0.5, Unix 27.0.1, 8 processors), from `dotnet test --filter FullyQualifiedName~AlgorithmPerformanceTests`:
+| Check in `AlgorithmPerformanceTests` | What the test asserts |
+| --- | --- |
+| Sorted AVL insert, then an inclusive range | 8192 keys. The window `2000`–`3999` returns 2000 values. Height stays below `2 * log2(n)` and within the AVL minimum-node bound |
+| History insert, then a timestamp range | 6000 readings. The window returns 500 rows, from second 1000 through second 1499 |
+| History eviction | Capacity 1500 after 4000 inserts. The older window is empty and the kept window has 1500 rows |
+| BFS, DFS, Kruskal, and Dijkstra on a path | 2000 vertices and 1999 edges of weight 1. Every vertex is visited, the forest has 1999 edges and total cost 1999, and the least-cost path costs 1999 |
+| Seeded campus route, then feeder failure | Least cost 15 and fewest-hop cost 22 while every catalogue device is online. With `30:AE:A4:10:01:03` offline the least cost is 16 and that MAC is absent from the path. Restoring the feeder returns cost 15 |
 
-| Check | Size | Observed |
-| --- | --- | --- |
-| Sorted AVL insert, then a range of 2000 keys | 8192 keys | Height 14, maximum AVL height 19. Insert 6.44 ms, range 0.25 ms |
-| History insert, then a range of 500 rows | 6000 readings | Insert 15.13 ms, range 0.07 ms |
-| BFS and Kruskal on a path | 2000 vertices, 1999 edges of weight 1 | BFS 1.76 ms, MST 1.26 ms, Dijkstra cost 1999 |
-| Seeded campus route, then feeder failure | 11 vertices, 16 catalogue edges | Route 10.68 ms, recalculation 0.26 ms |
+Run the same checks with:
 
-A second execution of the same filter produced different milliseconds. That is expected for a single-process stopwatch.
-
-Those milliseconds come from a Debug `dotnet test` run. `Stopwatch` is wall-clock time, with no warmup and no repeated samples. The 6.44 ms AVL insert includes `CheckInvariants` on every 1024th key. The 10.68 ms campus route is `MeshTopologyService.Route`, which rebuilds the graphs. The 0.26 ms failure figure includes `TrySetOnline` as well as the next route. Section 13 of `PART3_FINAL_REPORT.md` records the same limits. The numbers are not isolated algorithm benchmarks, and they were not re-measured for the documentation update.
+```bash
+dotnet test SmartX.Tests/SmartX.Tests.csproj --filter FullyQualifiedName~AlgorithmPerformanceTests
+```
 
 ---
 
@@ -446,7 +457,7 @@ Recommendation categories produced by `RecommendationService`: `threshold`, `tre
 | Measured size checks | `AlgorithmPerformanceTests` |
 | Part 1 HTTP contract | `Part1ApiContractTests` |
 
-There is no automated browser project. The topology, ingestion, command stream, registration, and tools pages were exercised manually against the running API and client. That session is written up in `PART3_FINAL_REPORT.md`. It is not a substitute for `dotnet test`.
+There is no automated browser project. `dotnet test` is the automated suite. The dashboard is exercised by opening the client routes above against a running API.
 
 ---
 
@@ -458,9 +469,8 @@ There is no automated browser project. The topology, ingestion, command stream, 
 - `POWER-CRITICAL` and `POWER-HIGH` clear when that clamp's own reading is at or below 2800 W. The feeder fault is the one that follows the 3500 W sum.
 - The deployment tree validates placement. It does not describe radio hops.
 - No authentication, no durable store, and no push channel. The client polls.
-- Docker files are in the tree. This documentation pass did not rebuild the containers.
-- Git has not been initialised in this working folder.
+- Recreating the API container clears the same in-memory state as stopping the API process.
 
 ## Further work
 
-Durable history, authenticated operators, a real link metric from the device, and a push channel would remove the limits above. `PART3_FINAL_REPORT.md` gives the .NET-specific tradeoffs. `FEEDBACK_AND_UPDATES.md` records the changes made in this working copy. `PART3_SUBMISSION_CHECKLIST.md` maps the Part 3 requirements to files.
+Durable history, authenticated operators, a measured link metric from the device, and a push channel would remove the limits above.
