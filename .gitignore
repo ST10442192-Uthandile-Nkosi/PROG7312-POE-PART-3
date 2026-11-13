@@ -1,0 +1,41 @@
+# .NET generated files
+**/bin/
+**/obj/
+
+# IDE and editor files
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+# macOS files
+.DS_Store
+**/.DS_Store
+__MACOSX/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.cache
+
+# Local secrets and environment files
+.env
+.env.*
+**/secrets.json
+**/appsettings.Development.local.json
+
+# Runtime uploads
+**/Uploads/
+
+# Report-only materials
+docs/figures/
+
+# Final reports and submission documents
+PART3_FINAL_REPORT.md
+FEEDBACK_AND_UPDATES.md
+PART3_SUBMISSION_CHECKLIST.md
+PROG7312_PART3_FINAL_REPORT.pdf
+
+# Separate PDF report generation
+docs/pdf/
